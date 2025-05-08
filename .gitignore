@@ -1,3 +1,16 @@
+# VSCode
+.vscode/
+
+# Python cache (PlatformIO uses Python under the hood)
+__pycache__/
+*.pyc
+
+# PlatformIO build files
+.pio/
+.pioenvs/
+.piolibdeps/
+.pio-lock
+
 # Prerequisites
 *.d
 

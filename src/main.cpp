@@ -3,23 +3,38 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Wire.h> // For I2C communication
-#include <MPU6050_light.h>
+// #include <MPU6050_light.h>
 #include <ESP32Servo.h> // https://madhephaestus.github.io/ESP32Servo/classServo.html
 #include <PID_v1.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 #define MIN_PULSE_LENGTH 1000 // https://howtomechatronics.com/tutorials/arduino/arduino-brushless-motor-control-tutorial-esc-bldc/
 #define MAX_PULSE_LENGTH 2000
 
 // MPU 6050 sensor
-MPU6050 mpu(Wire); // TODO: Change on ESP32 -> GPIO 21 (SDA), GPIO 22 (SCL)
+// MPU6050 mpu(Wire); // TODO: Change on ESP32 -> GPIO 21 (SDA), GPIO 22 (SCL)
+Adafruit_MPU6050 mpu;
+float getRoll(float ax, float ay, float az);
 
 // Escs
 Servo yellowEsc;
 Servo pinkEsc;
 
-// Filter
+// Kalman filter
+float kalmanAngle = 0.0;
+float bias = 0.0;
+float rate;
+float covarianceMatrix[2][2] = {{0, 0}, {0, 0}};
+float Q_angle = 0.001;
+float Q_bias = 0.003;
+float R_measure = 0.03;
+float kalmanFilter(float newAngle, float newRate, float dt);
+float kalmanFilteredAngle = 0.0;
+
+// Mean filter
 float getFilteredAngle();
-float buff[5], filteredAngle = 0;
+float buff[5], meanFilteredAngle = 0.0;
 
 // Calibration
 void calibrateSensor();
@@ -68,15 +83,28 @@ void setup()
   esp_now_register_recv_cb(OnDataRecv);
 
   // MPU 6050 setup
+  /*
   Wire.begin();
   mpu.begin();
   //calibrateSensor();
-  mpu.setFilterGyroCoef(0.98);
+  mpu.setFilterGyroCoef(0.90);
+  */
+  if (!mpu.begin())
+  {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1)
+    {
+      delay(10);
+    }
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
   // Escs setup
   yellowEsc.attach(16, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
   pinkEsc.attach(17, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
-  //calibrateEscs();
+  // calibrateEscs();
 }
 
 void loop()
@@ -85,18 +113,67 @@ void loop()
   initialTime = millis();
 
   // angle
+  /*
   mpu.update();
   measuredAngle = mpu.getAngleX();
-  filteredAngle = getFilteredAngle();
+  */
 
-  Serial.print(">measuredAngle:");
-  Serial.println(measuredAngle);
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  measuredAngle = getRoll(a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  
+  // Kalman
+  float dt = (millis() - initialTime) / 1000.0;
+  kalmanFilteredAngle = kalmanFilter(measuredAngle, g.gyro.x * 180.0 / PI, dt);
+
+  //meanFilteredAngle = getFilteredAngle();
+
+  Serial.print(kalmanFilteredAngle);
+  //Serial.print("\t");
+  //Serial.println(meanFilteredAngle);
 
   setMotors();
 
   finalTime = millis();
   if (finalTime - initialTime < 50)
     delay(50 - (finalTime - initialTime));
+}
+
+float kalmanFilter(float newAngle, float newRate, float dt)
+{
+  // Predict
+  rate = newRate - bias;
+  kalmanAngle += dt * rate;
+
+  covarianceMatrix[0][0] += dt * (dt * covarianceMatrix[1][1] - covarianceMatrix[1][0] - covarianceMatrix[0][1] + Q_angle);
+  covarianceMatrix[0][1] -= dt * covarianceMatrix[1][1];
+  covarianceMatrix[1][0] -= dt * covarianceMatrix[1][1];
+  covarianceMatrix[1][1] += Q_bias * dt;
+
+  // Update
+  float S = covarianceMatrix[0][0] + R_measure;
+  float K[2];
+  K[0] = covarianceMatrix[0][0] / S;
+  K[1] = covarianceMatrix[1][0] / S;
+
+  float y = newAngle - kalmanAngle;
+  kalmanAngle += K[0] * y;
+  bias += K[1] * y;
+
+  float P00_temp = covarianceMatrix[0][0];
+  float P01_temp = covarianceMatrix[0][1];
+
+  covarianceMatrix[0][0] -= K[0] * P00_temp;
+  covarianceMatrix[0][1] -= K[0] * P01_temp;
+  covarianceMatrix[1][0] -= K[1] * P00_temp;
+  covarianceMatrix[1][1] -= K[1] * P01_temp;
+
+  return kalmanAngle;
+}
+
+float getRoll(float ax, float ay, float az)
+{
+  return atan2(ay, az) * 180.0 / PI;
 }
 
 void readMacAddress()
@@ -148,7 +225,7 @@ void calculatePid()
 {
   deltaT = (millis() - initialTime) / 1000.0;
 
-  error = receivedData.ref - filteredAngle;
+  error = receivedData.ref - kalmanFilteredAngle;
 
   P = receivedData.kp * error;
   I += receivedData.ki * error * deltaT;
@@ -180,7 +257,7 @@ void calibrateEscs()
   Serial.println("ESCs calibration done.");
   return;
 }
-
+/*
 void calibrateSensor()
 {
   Serial.println("Calibrating MPU sensor...");
@@ -188,6 +265,7 @@ void calibrateSensor()
   delay(100);
   Serial.println("MPU calibration done");
 }
+*/
 
 float getFilteredAngle()
 {
@@ -196,7 +274,7 @@ float getFilteredAngle()
   buff[1] = buff[2];
   buff[2] = buff[3];
   buff[3] = buff[4];
-  buff[4] = measuredAngle;
+  buff[4] = kalmanFilteredAngle;
 
   return (buff[0] + buff[1] + buff[2] + buff[3] + buff[4]) / 5;
 }
