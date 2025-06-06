@@ -12,6 +12,17 @@
 #define MIN_PULSE_LENGTH 1000 // https://howtomechatronics.com/tutorials/arduino/arduino-brushless-motor-control-tutorial-esc-bldc/
 #define MAX_PULSE_LENGTH 2000
 
+#define POTENTIOMETER_SENSOR 32
+int potentiometerValue = 0;
+
+// Encoder
+#define ENCODER_PIN_A 12
+#define ENCODER_PIN_B 13
+volatile int encoderAngle = 0;
+volatile bool lastEncoded = 0;
+void IRAM_ATTR handleEncoder();
+static int lastPos = 0;
+
 // MPU 6050 sensor
 // MPU6050 mpu(Wire); // TODO: Change on ESP32 -> GPIO 21 (SDA), GPIO 22 (SCL)
 Adafruit_MPU6050 mpu;
@@ -26,9 +37,23 @@ float kalmanAngle = 0.0;
 float bias = 0.0;
 float rate;
 float covarianceMatrix[2][2] = {{0, 0}, {0, 0}};
+/*Ruído do processo para o ângulo
+Aumentar Q_angle → o filtro responde mais rápido a mudanças no sinal de entrada.
+Reduzir Q_angle → o filtro confia mais nas previsões internas, ignorando variações rápidas.*/
 float Q_angle = 0.001;
+/*
+Ruído do processo para o bias do giroscópio
+Aumentar Q_bias → o filtro ajusta o bias mais rapidamente, útil se o bias do giroscópio varia com o tempo.
+Reduzir Q_bias → o filtro considera o bias mais constante.
+*/
 float Q_bias = 0.003;
-float R_measure = 0.03;
+/*
+Ruído da medição (do acelerômetro, por exemplo)
+Reduzir R_measure → o filtro confia mais no sensor, reagindo mais rapidamente a mudanças.
+Aumentar R_measure → o filtro considera a medição ruidosa, e responde mais lentamente.
+*/
+float R_measure = 0.0001;
+
 float kalmanFilter(float newAngle, float newRate, float dt);
 float kalmanFilteredAngle = 0.0;
 
@@ -62,7 +87,7 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len); // Ca
 void readMacAddress();
 
 double P, I, D;
-float deltaT, error, previousError, pidOutput;
+float deltaT, error, previousError = 0.0, pidOutput;
 void calculatePid();
 
 unsigned long initialTime = 0, finalTime = 0;
@@ -81,6 +106,12 @@ void setup()
     return;
   }
   esp_now_register_recv_cb(OnDataRecv);
+
+  // Encoder setup
+  pinMode(ENCODER_PIN_A, INPUT_PULLUP);
+  pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), handleEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), handleEncoder, CHANGE);
 
   // MPU 6050 setup
   /*
@@ -102,8 +133,8 @@ void setup()
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
   // Escs setup
-  yellowEsc.attach(16, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
-  pinkEsc.attach(17, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
+  yellowEsc.attach(17, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
+  pinkEsc.attach(16, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
   // calibrateEscs();
 }
 
@@ -118,25 +149,69 @@ void loop()
   measuredAngle = mpu.getAngleX();
   */
 
+  if (lastPos != encoderAngle)
+  {
+    lastPos = encoderAngle;
+    lastPos = lastPos*89/95; 
+  }
+
+
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
   measuredAngle = getRoll(a.acceleration.x, a.acceleration.y, a.acceleration.z);
-  
+
   // Kalman
   float dt = (millis() - initialTime) / 1000.0;
   kalmanFilteredAngle = kalmanFilter(measuredAngle, g.gyro.x * 180.0 / PI, dt);
 
-  //meanFilteredAngle = getFilteredAngle();
+  // meanFilteredAngle = getFilteredAngle();
 
-  Serial.print(kalmanFilteredAngle);
+  Serial.print(lastPos);
+  Serial.print("\t");
+  Serial.println(receivedData.ref);
+
   //Serial.print("\t");
-  //Serial.println(meanFilteredAngle);
+  //Serial.println(measuredAngle);
+
+  //Serial.print(P);
+  //Serial.print("\t");
+  //Serial.print(I);
+  //Serial.print("\t");
+  //Serial.println(D);
+
+  // Serial.print("\t");
+  // Serial.println(pidOutput);
+  // Serial.print("\t");
+
+  // Potentiometer sensor
+  potentiometerValue = analogRead(32);
+  //Serial.println(potentiometerValue);
 
   setMotors();
 
   finalTime = millis();
   if (finalTime - initialTime < 50)
     delay(50 - (finalTime - initialTime));
+}
+
+void IRAM_ATTR handleEncoder()
+{
+  bool MSB = digitalRead(ENCODER_PIN_A);
+  bool LSB = digitalRead(ENCODER_PIN_B);
+
+  int encoded = (MSB << 1) | LSB;
+  int sum = (lastEncoded << 2) | encoded;
+
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011)
+  {
+    encoderAngle--;
+  }
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000)
+  {
+    encoderAngle++;
+  }
+
+  lastEncoded = encoded;
 }
 
 float kalmanFilter(float newAngle, float newRate, float dt)
@@ -225,15 +300,25 @@ void calculatePid()
 {
   deltaT = (millis() - initialTime) / 1000.0;
 
-  error = receivedData.ref - kalmanFilteredAngle;
+  // error = receivedData.ref - kalmanFilteredAngle;
+  error = receivedData.ref - lastPos;
 
   P = receivedData.kp * error;
-  I += receivedData.ki * error * deltaT;
+  
   D = receivedData.kd * (error - previousError) / deltaT;
 
   previousError = error;
 
   pidOutput = P + I + D;
+  
+  // Anti-windup: saturation and clamping
+  if (pidOutput > 200)
+    pidOutput = 200;
+  else if (pidOutput < -200)
+    pidOutput = -200;
+  else 
+    I += receivedData.ki * error * deltaT;
+  
 }
 
 void calibrateEscs()
