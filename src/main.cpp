@@ -18,13 +18,12 @@ int potentiometerValue = 0;
 // Encoder
 #define ENCODER_PIN_A 12
 #define ENCODER_PIN_B 13
-volatile int encoderAngle = 0;
+volatile int lastPositionEncoder = 0;
 volatile bool lastEncoded = 0;
 void IRAM_ATTR handleEncoder();
-static int lastPos = 0;
+static int encoderAngle = 0;
 
-// MPU 6050 sensor
-// MPU6050 mpu(Wire); // TODO: Change on ESP32 -> GPIO 21 (SDA), GPIO 22 (SCL)
+// MPU 6050 sensor -> GPIO 21 (SDA), GPIO 22 (SCL)
 Adafruit_MPU6050 mpu;
 float getRoll(float ax, float ay, float az);
 
@@ -36,7 +35,7 @@ Servo pinkEsc;
 float kalmanAngle = 0.0;
 float bias = 0.0;
 float rate;
-float covarianceMatrix[2][2] = {{0, 0}, {0, 0}};
+float PKalman[2][2] = {{0, 0}, {0, 0}};
 /*Ruído do processo para o ângulo
 Aumentar Q_angle → o filtro responde mais rápido a mudanças no sinal de entrada.
 Reduzir Q_angle → o filtro confia mais nas previsões internas, ignorando variações rápidas.*/
@@ -52,7 +51,7 @@ Ruído da medição (do acelerômetro, por exemplo)
 Reduzir R_measure → o filtro confia mais no sensor, reagindo mais rapidamente a mudanças.
 Aumentar R_measure → o filtro considera a medição ruidosa, e responde mais lentamente.
 */
-float R_measure = 0.0001;
+float R_measure = 0.000005;
 
 float kalmanFilter(float newAngle, float newRate, float dt);
 float kalmanFilteredAngle = 0.0;
@@ -69,6 +68,7 @@ float measuredAngle;
 void getRemoteControlParameters();
 void printRemoteControlParameters();
 void setMotors();
+float usedAngle = 0.0; // angle used for PID control
 
 typedef struct message_struct
 {
@@ -78,7 +78,7 @@ typedef struct message_struct
   float gyr = 0.98;
   float ref = 0;
   int automaticState = 1;
-  int disturbanceState = 0;
+  int sensorState = 0;
 } message_struct;
 
 message_struct receivedData;
@@ -114,12 +114,6 @@ void setup()
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), handleEncoder, CHANGE);
 
   // MPU 6050 setup
-  /*
-  Wire.begin();
-  mpu.begin();
-  //calibrateSensor();
-  mpu.setFilterGyroCoef(0.90);
-  */
   if (!mpu.begin())
   {
     Serial.println("Failed to find MPU6050 chip");
@@ -128,9 +122,9 @@ void setup()
       delay(10);
     }
   }
-  mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_10_HZ);
+  mpu.setHighPassFilter(MPU6050_HIGHPASS_DISABLE);
+  // mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
 
   // Escs setup
   yellowEsc.attach(17, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
@@ -143,51 +137,48 @@ void loop()
 
   initialTime = millis();
 
-  // angle
-  /*
-  mpu.update();
-  measuredAngle = mpu.getAngleX();
-  */
-
-  if (lastPos != encoderAngle)
+  // encoder
+  if (encoderAngle != lastPositionEncoder)
   {
-    lastPos = encoderAngle;
-    lastPos = lastPos*89/95; 
+    encoderAngle = lastPositionEncoder;
+    encoderAngle = encoderAngle * 89 / 105;
   }
 
-
+  // mpu 6050
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
   measuredAngle = getRoll(a.acceleration.x, a.acceleration.y, a.acceleration.z);
-
   // Kalman
   float dt = (millis() - initialTime) / 1000.0;
   kalmanFilteredAngle = kalmanFilter(measuredAngle, g.gyro.x * 180.0 / PI, dt);
 
-  // meanFilteredAngle = getFilteredAngle();
+  if (receivedData.sensorState == 1)
+  {
+    usedAngle = kalmanFilteredAngle;
+    // Serial.print(kalmanFilteredAngle);
+    // Serial.print("\t");
+  }
+  else
+  {
+    usedAngle = encoderAngle;
+    // Serial.print(encoderAngle);
+    // Serial.print("\t");
+  }
 
-  Serial.print(lastPos);
+  Serial.print(kalmanFilteredAngle);
   Serial.print("\t");
-  Serial.println(receivedData.ref);
-
-  //Serial.print("\t");
-  //Serial.println(measuredAngle);
-
-  //Serial.print(P);
-  //Serial.print("\t");
-  //Serial.print(I);
-  //Serial.print("\t");
-  //Serial.println(D);
-
-  // Serial.print("\t");
-  // Serial.println(pidOutput);
-  // Serial.print("\t");
-
-  // Potentiometer sensor
-  potentiometerValue = analogRead(32);
-  //Serial.println(potentiometerValue);
+  Serial.print(encoderAngle);
+  Serial.print("\t");
+  Serial.print(receivedData.ref);
+  Serial.print("\t");
 
   setMotors();
+
+  Serial.print(P);
+  Serial.print("\t");
+  Serial.print(I);
+  Serial.print("\t");
+  Serial.println(D);
 
   finalTime = millis();
   if (finalTime - initialTime < 50)
@@ -204,44 +195,43 @@ void IRAM_ATTR handleEncoder()
 
   if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011)
   {
-    encoderAngle--;
+    lastPositionEncoder--;
   }
   if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000)
   {
-    encoderAngle++;
+    lastPositionEncoder++;
   }
 
   lastEncoded = encoded;
 }
 
 float kalmanFilter(float newAngle, float newRate, float dt)
-{
-  // Predict
+{ /*
+  https://github.com/jarzebski/Arduino-KalmanFilter/tree/master
+   */
   rate = newRate - bias;
   kalmanAngle += dt * rate;
 
-  covarianceMatrix[0][0] += dt * (dt * covarianceMatrix[1][1] - covarianceMatrix[1][0] - covarianceMatrix[0][1] + Q_angle);
-  covarianceMatrix[0][1] -= dt * covarianceMatrix[1][1];
-  covarianceMatrix[1][0] -= dt * covarianceMatrix[1][1];
-  covarianceMatrix[1][1] += Q_bias * dt;
+  PKalman[0][0] += dt * (PKalman[1][1] + PKalman[0][1]) + Q_angle * dt;
+  PKalman[0][1] -= dt * PKalman[1][1];
+  PKalman[1][0] -= dt * PKalman[1][1];
+  PKalman[1][1] += Q_bias * dt;
 
-  // Update
-  float S = covarianceMatrix[0][0] + R_measure;
+  float S = PKalman[0][0] + R_measure;
   float K[2];
-  K[0] = covarianceMatrix[0][0] / S;
-  K[1] = covarianceMatrix[1][0] / S;
+
+  K[0] = PKalman[0][0] / S;
+  K[1] = PKalman[1][0] / S;
 
   float y = newAngle - kalmanAngle;
+
   kalmanAngle += K[0] * y;
   bias += K[1] * y;
 
-  float P00_temp = covarianceMatrix[0][0];
-  float P01_temp = covarianceMatrix[0][1];
-
-  covarianceMatrix[0][0] -= K[0] * P00_temp;
-  covarianceMatrix[0][1] -= K[0] * P01_temp;
-  covarianceMatrix[1][0] -= K[1] * P00_temp;
-  covarianceMatrix[1][1] -= K[1] * P01_temp;
+  PKalman[0][0] -= K[0] * PKalman[0][0];
+  PKalman[0][1] -= K[0] * PKalman[0][1];
+  PKalman[1][0] -= K[1] * PKalman[0][0];
+  PKalman[1][1] -= K[1] * PKalman[0][1];
 
   return kalmanAngle;
 }
@@ -290,35 +280,35 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
   Serial.println(receivedData.ref);
   Serial.print("automaticState: ");
   Serial.println(receivedData.automaticState);
-  Serial.print("disturbanceState: ");
-  Serial.println(receivedData.disturbanceState);
+  Serial.print("sensorState: ");
+  Serial.println(receivedData.sensorState);
   Serial.println();
   */
 }
 
 void calculatePid()
 {
-  deltaT = (millis() - initialTime) / 1000.0;
+  deltaT = (millis() - initialTime);
 
-  // error = receivedData.ref - kalmanFilteredAngle;
-  error = receivedData.ref - lastPos;
+  error = receivedData.ref - usedAngle;
 
   P = receivedData.kp * error;
-  
-  D = receivedData.kd * (error - previousError) / deltaT;
+
+  D = 10 * receivedData.kd * (error - previousError) / deltaT;
 
   previousError = error;
 
   pidOutput = P + I + D;
-  
+
   // Anti-windup: saturation and clamping
   if (pidOutput > 200)
     pidOutput = 200;
   else if (pidOutput < -200)
     pidOutput = -200;
-  else 
-    I += receivedData.ki * error * deltaT;
-  
+  else if (receivedData.ki == 0)
+    I = 0;
+  else
+    I += receivedData.ki * error * deltaT / 1000;
 }
 
 void calibrateEscs()
@@ -342,15 +332,6 @@ void calibrateEscs()
   Serial.println("ESCs calibration done.");
   return;
 }
-/*
-void calibrateSensor()
-{
-  Serial.println("Calibrating MPU sensor...");
-  mpu.calcOffsets(true, true); // Calculate offsets for gyro and acc
-  delay(100);
-  Serial.println("MPU calibration done");
-}
-*/
 
 float getFilteredAngle()
 {
