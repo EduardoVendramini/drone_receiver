@@ -15,13 +15,18 @@
 #define POTENTIOMETER_SENSOR 32
 int potentiometerValue = 0;
 
-// Encoder
+// Encoder - Variáveis corrigidas
 #define ENCODER_PIN_A 12
 #define ENCODER_PIN_B 13
-volatile int lastPositionEncoder = 0;
-volatile bool lastEncoded = 0;
+volatile long lastPositionEncoder = 0;
+volatile int lastEncoded = 0;
+volatile unsigned long lastInterruptTime = 0;
+
+// Debouncing time em microssegundos (ajuste conforme necessário)
+const unsigned long DEBOUNCE_TIME = 1000; // 1ms
+
 void IRAM_ATTR handleEncoder();
-static int encoderAngle = 0;
+static float encoderAngle = 0.0;
 
 // MPU 6050 sensor -> GPIO 21 (SDA), GPIO 22 (SCL)
 Adafruit_MPU6050 mpu;
@@ -90,6 +95,10 @@ double P, I, D;
 float deltaT, error, previousError = 0.0, pidOutput;
 void calculatePid();
 
+// Funções auxiliares para o encoder
+long getEncoderPosition();
+void resetEncoderPosition();
+
 unsigned long initialTime = 0, finalTime = 0;
 
 void setup()
@@ -107,9 +116,16 @@ void setup()
   }
   esp_now_register_recv_cb(OnDataRecv);
 
-  // Encoder setup
+  // Encoder setup - Corrigido
   pinMode(ENCODER_PIN_A, INPUT_PULLUP);
   pinMode(ENCODER_PIN_B, INPUT_PULLUP);
+  
+  // Inicializar estado do encoder
+  bool MSB = digitalRead(ENCODER_PIN_A);
+  bool LSB = digitalRead(ENCODER_PIN_B);
+  lastEncoded = (MSB << 1) | LSB;
+  
+  // Attach interrupts para ambos os pinos
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), handleEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), handleEncoder, CHANGE);
 
@@ -134,14 +150,18 @@ void setup()
 
 void loop()
 {
-
   initialTime = millis();
 
-  // encoder
-  if (encoderAngle != lastPositionEncoder)
+  // encoder - Corrigido
+  static long lastEncoderPosition = 0;
+  long currentEncoderPosition = getEncoderPosition();
+  
+  if (currentEncoderPosition != lastEncoderPosition)
   {
-    encoderAngle = lastPositionEncoder;
-    encoderAngle = encoderAngle * 89 / 105;
+    // Converter posição para ângulo
+    // Ajuste o fator de conversão conforme seu encoder
+    encoderAngle = currentEncoderPosition * 87.0 / 400.0;
+    lastEncoderPosition = currentEncoderPosition;
   }
 
   // mpu 6050
@@ -185,24 +205,62 @@ void loop()
     delay(50 - (finalTime - initialTime));
 }
 
+// Função de interrupção do encoder - Corrigida
 void IRAM_ATTR handleEncoder()
 {
+  // Debouncing por tempo
+  unsigned long interruptTime = micros();
+  if (interruptTime - lastInterruptTime < DEBOUNCE_TIME) {
+    return;
+  }
+  lastInterruptTime = interruptTime;
+
+  // Leitura dos pinos
   bool MSB = digitalRead(ENCODER_PIN_A);
   bool LSB = digitalRead(ENCODER_PIN_B);
 
   int encoded = (MSB << 1) | LSB;
   int sum = (lastEncoded << 2) | encoded;
 
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011)
-  {
-    lastPositionEncoder--;
-  }
-  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000)
-  {
-    lastPositionEncoder++;
+  // Tabela de estados para encoder em quadratura
+  // Rotação horária: 00 -> 01 -> 11 -> 10 -> 00
+  // Rotação anti-horária: 00 -> 10 -> 11 -> 01 -> 00
+  switch (sum) {
+    case 0b0001: // 00 -> 01
+    case 0b0111: // 01 -> 11  
+    case 0b1110: // 11 -> 10
+    case 0b1000: // 10 -> 00
+      lastPositionEncoder++;
+      break;
+      
+    case 0b0010: // 00 -> 10
+    case 0b1011: // 10 -> 11
+    case 0b1101: // 11 -> 01
+    case 0b0100: // 01 -> 00
+      lastPositionEncoder--;
+      break;
+      
+    default:
+      // Estados inválidos - ignorar
+      break;
   }
 
   lastEncoded = encoded;
+}
+
+// Função para ler posição do encoder de forma segura
+long getEncoderPosition() {
+  noInterrupts();
+  long pos = lastPositionEncoder;
+  interrupts();
+  return pos;
+}
+
+// Função para resetar posição do encoder
+void resetEncoderPosition() {
+  noInterrupts();
+  lastPositionEncoder = 0;
+  interrupts();
 }
 
 float kalmanFilter(float newAngle, float newRate, float dt)
