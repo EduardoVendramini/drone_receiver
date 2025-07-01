@@ -30,7 +30,10 @@ static float encoderAngle = 0.0;
 
 // MPU 6050 sensor -> GPIO 21 (SDA), GPIO 22 (SCL)
 Adafruit_MPU6050 mpu;
-float getRoll(float ax, float ay, float az);
+float complementaryAngle = 0.0;
+float gyroAngleX = 0.0;
+float accelAngleX = 0.0;
+float gyroRate = 0.0; // °/s
 
 // Escs
 Servo yellowEsc;
@@ -38,49 +41,52 @@ Servo pinkEsc;
 
 // Kalman filter
 float kalmanAngle = 0.0;
-float bias = 0.0;
-float rate;
+float K_bias = 0.0;
+float K_rate = 0.0;
 float PKalman[2][2] = {{0, 0}, {0, 0}};
+float K[2];
+float S = 0.0;
+float dt0Kalman = 0.0;
+float dt1Kalman = 0.0;
+float y = 0.0;
 /*Ruído do processo para o ângulo
 Aumentar Q_angle → o filtro responde mais rápido a mudanças no sinal de entrada.
 Reduzir Q_angle → o filtro confia mais nas previsões internas, ignorando variações rápidas.*/
-float Q_angle = 0.001;
+float Q_angle = 0.01; // valor muito baixo estoura valores
 /*
 Ruído do processo para o bias do giroscópio
 Aumentar Q_bias → o filtro ajusta o bias mais rapidamente, útil se o bias do giroscópio varia com o tempo.
 Reduzir Q_bias → o filtro considera o bias mais constante.
 */
-float Q_bias = 0.003;
-/*
+float Q_bias = 0.0003;
+/*0.003
 Ruído da medição (do acelerômetro, por exemplo)
 Reduzir R_measure → o filtro confia mais no sensor, reagindo mais rapidamente a mudanças.
 Aumentar R_measure → o filtro considera a medição ruidosa, e responde mais lentamente.
 */
-float R_measure = 0.000005;
+float R_measure = 0.9; 
 
-float kalmanFilter(float newAngle, float newRate, float dt);
-float kalmanFilteredAngle = 0.0;
+float kalmanFilter(float newAngle, float newRate);
+float K_angle = 0.0;
 
 // Mean filter
-float getFilteredAngle();
+float getMeanFilteredAngle(float angle);
 float buff[5], meanFilteredAngle = 0.0;
 
 // Calibration
 void calibrateSensor();
 void calibrateEscs();
 
-float measuredAngle;
 void getRemoteControlParameters();
 void printRemoteControlParameters();
 void setMotors();
-float usedAngle = 0.0; // angle used for PID control
 
 typedef struct message_struct
 {
-  float kp = 1.5, ki = 0.05, kd = 0;
+  float kp = 1.2, ki = 7.0, kd = 3.2;
   int m1 = MIN_PULSE_LENGTH;
   int m2 = MIN_PULSE_LENGTH;
-  float gyr = 0.98;
+  float gyr = 0.98; // alpha for complementary filter
   float ref = 0;
   int automaticState = 1;
   int sensorState = 0;
@@ -95,11 +101,17 @@ double P, I, D;
 float deltaT, error, previousError = 0.0, pidOutput;
 void calculatePid();
 
-// Funções auxiliares para o encoder
 long getEncoderPosition();
 void resetEncoderPosition();
 
 unsigned long initialTime = 0, finalTime = 0;
+
+// complementary filter variables
+float dt0Complementary = 0.0;
+float alpha = 0.9; // complementary filter constant
+float dt1Complementary = 0.0;
+
+float usedAngle = 0.0; // angle used for PID control
 
 void setup()
 {
@@ -119,12 +131,12 @@ void setup()
   // Encoder setup - Corrigido
   pinMode(ENCODER_PIN_A, INPUT_PULLUP);
   pinMode(ENCODER_PIN_B, INPUT_PULLUP);
-  
+
   // Inicializar estado do encoder
   bool MSB = digitalRead(ENCODER_PIN_A);
   bool LSB = digitalRead(ENCODER_PIN_B);
   lastEncoded = (MSB << 1) | LSB;
-  
+
   // Attach interrupts para ambos os pinos
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_A), handleEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN_B), handleEncoder, CHANGE);
@@ -146,20 +158,22 @@ void setup()
   yellowEsc.attach(17, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
   pinkEsc.attach(16, MIN_PULSE_LENGTH, MAX_PULSE_LENGTH);
   // calibrateEscs();
+
+  dt1Kalman = millis();
+  dt1Complementary = millis();
 }
 
 void loop()
 {
   initialTime = millis();
 
-  // encoder - Corrigido
+  // encoder
   static long lastEncoderPosition = 0;
   long currentEncoderPosition = getEncoderPosition();
-  
+
   if (currentEncoderPosition != lastEncoderPosition)
   {
-    // Converter posição para ângulo
-    // Ajuste o fator de conversão conforme seu encoder
+    // Convert encoder position to angle
     encoderAngle = currentEncoderPosition * 87.0 / 400.0;
     lastEncoderPosition = currentEncoderPosition;
   }
@@ -167,50 +181,57 @@ void loop()
   // mpu 6050
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
-  measuredAngle = getRoll(a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  accelAngleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+  gyroRate = (g.gyro.x + 0.029) * (180.0 / PI); // 0.029 is the bias of the gyroscope
+
+  // Complementary filter
+  dt0Complementary = (millis() - dt1Complementary) / 1000.0;
+  dt1Complementary = millis();
+  gyroAngleX += gyroRate * dt0Complementary;
+  complementaryAngle = alpha * gyroAngleX + (1 - alpha) * accelAngleX;
+
+  // Mean filter
+  meanFilteredAngle = getMeanFilteredAngle(complementaryAngle);
+
   // Kalman
-  float dt = (millis() - initialTime) / 1000.0;
-  kalmanFilteredAngle = kalmanFilter(measuredAngle, g.gyro.x * 180.0 / PI, dt);
+  K_angle = kalmanFilter(accelAngleX, gyroRate);
 
   if (receivedData.sensorState == 1)
   {
-    usedAngle = kalmanFilteredAngle;
-    // Serial.print(kalmanFilteredAngle);
-    // Serial.print("\t");
+    usedAngle = complementaryAngle;
   }
   else
   {
     usedAngle = encoderAngle;
-    // Serial.print(encoderAngle);
-    // Serial.print("\t");
+    //usedAngle = K_angle;
   }
-
-  Serial.print(kalmanFilteredAngle);
+  Serial.print(complementaryAngle);
   Serial.print("\t");
-  Serial.print(encoderAngle);
+  Serial.print(meanFilteredAngle);
   Serial.print("\t");
-  Serial.print(receivedData.ref);
+  Serial.print(K_angle);
   Serial.print("\t");
+  Serial.println(encoderAngle);
 
   setMotors();
 
-  Serial.print(P);
-  Serial.print("\t");
-  Serial.print(I);
-  Serial.print("\t");
-  Serial.println(D);
+  // Serial.print(P);
+  // Serial.print("\t");
+  // Serial.print(I);
+  // Serial.print("\t");
+  // Serial.println(D);
 
   finalTime = millis();
   if (finalTime - initialTime < 50)
     delay(50 - (finalTime - initialTime));
 }
 
-// Função de interrupção do encoder - Corrigida
 void IRAM_ATTR handleEncoder()
 {
   // Debouncing por tempo
   unsigned long interruptTime = micros();
-  if (interruptTime - lastInterruptTime < DEBOUNCE_TIME) {
+  if (interruptTime - lastInterruptTime < DEBOUNCE_TIME)
+  {
     return;
   }
   lastInterruptTime = interruptTime;
@@ -225,78 +246,77 @@ void IRAM_ATTR handleEncoder()
   // Tabela de estados para encoder em quadratura
   // Rotação horária: 00 -> 01 -> 11 -> 10 -> 00
   // Rotação anti-horária: 00 -> 10 -> 11 -> 01 -> 00
-  switch (sum) {
-    case 0b0001: // 00 -> 01
-    case 0b0111: // 01 -> 11  
-    case 0b1110: // 11 -> 10
-    case 0b1000: // 10 -> 00
-      lastPositionEncoder++;
-      break;
-      
-    case 0b0010: // 00 -> 10
-    case 0b1011: // 10 -> 11
-    case 0b1101: // 11 -> 01
-    case 0b0100: // 01 -> 00
-      lastPositionEncoder--;
-      break;
-      
-    default:
-      // Estados inválidos - ignorar
-      break;
+  switch (sum)
+  {
+  case 0b0001: // 00 -> 01
+  case 0b0111: // 01 -> 11
+  case 0b1110: // 11 -> 10
+  case 0b1000: // 10 -> 00
+    lastPositionEncoder++;
+    break;
+
+  case 0b0010: // 00 -> 10
+  case 0b1011: // 10 -> 11
+  case 0b1101: // 11 -> 01
+  case 0b0100: // 01 -> 00
+    lastPositionEncoder--;
+    break;
+
+  default:
+    // Estados inválidos - ignorar
+    break;
   }
 
   lastEncoded = encoded;
 }
 
-// Função para ler posição do encoder de forma segura
-long getEncoderPosition() {
+long getEncoderPosition()
+{
   noInterrupts();
   long pos = lastPositionEncoder;
   interrupts();
   return pos;
 }
 
-// Função para resetar posição do encoder
-void resetEncoderPosition() {
+void resetEncoderPosition()
+{
   noInterrupts();
   lastPositionEncoder = 0;
   interrupts();
 }
 
-float kalmanFilter(float newAngle, float newRate, float dt)
-{ /*
-  https://github.com/jarzebski/Arduino-KalmanFilter/tree/master
-   */
-  rate = newRate - bias;
-  kalmanAngle += dt * rate;
+float kalmanFilter(float newAngle, float newRate)
+{
+  // https://github.com/jarzebski/Arduino-KalmanFilter/tree/master
 
-  PKalman[0][0] += dt * (PKalman[1][1] + PKalman[0][1]) + Q_angle * dt;
-  PKalman[0][1] -= dt * PKalman[1][1];
-  PKalman[1][0] -= dt * PKalman[1][1];
-  PKalman[1][1] += Q_bias * dt;
+  dt0Kalman = (millis() - dt1Kalman) / 1000;
 
-  float S = PKalman[0][0] + R_measure;
-  float K[2];
+  K_rate = newRate - K_bias;
+  K_angle += dt0Kalman * K_rate;
+
+  PKalman[0][0] += dt0Kalman * (PKalman[1][1] + PKalman[0][1]) + Q_angle * dt0Kalman;
+  PKalman[0][1] -= dt0Kalman * PKalman[1][1];
+  PKalman[1][0] -= dt0Kalman * PKalman[1][1];
+  PKalman[1][1] += Q_bias * dt0Kalman;
+
+  S = PKalman[0][0] + R_measure;
 
   K[0] = PKalman[0][0] / S;
   K[1] = PKalman[1][0] / S;
 
-  float y = newAngle - kalmanAngle;
+  y = newAngle - K_angle;
 
-  kalmanAngle += K[0] * y;
-  bias += K[1] * y;
+  K_angle += K[0] * y;
+  K_bias += K[1] * y;
 
   PKalman[0][0] -= K[0] * PKalman[0][0];
   PKalman[0][1] -= K[0] * PKalman[0][1];
   PKalman[1][0] -= K[1] * PKalman[0][0];
   PKalman[1][1] -= K[1] * PKalman[0][1];
 
-  return kalmanAngle;
-}
+  dt1Kalman = millis();
 
-float getRoll(float ax, float ay, float az)
-{
-  return atan2(ay, az) * 180.0 / PI;
+  return K_angle;
 }
 
 void readMacAddress()
@@ -391,14 +411,14 @@ void calibrateEscs()
   return;
 }
 
-float getFilteredAngle()
+float getMeanFilteredAngle(float angle)
 {
   // This function returns the mean from the previous 5 values of angle measured
   buff[0] = buff[1];
   buff[1] = buff[2];
   buff[2] = buff[3];
   buff[3] = buff[4];
-  buff[4] = kalmanFilteredAngle;
+  buff[4] = angle;
 
   return (buff[0] + buff[1] + buff[2] + buff[3] + buff[4]) / 5;
 }
